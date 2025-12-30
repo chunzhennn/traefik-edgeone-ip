@@ -1,0 +1,12 @@
+displayName: Traefik EdgeOne IP
+type: middleware
+import: github.com/chunzhennn/traefik-edgeone-ip
+summary: Validate EdgeOne source IP via API and set real client IP headers safely.
+testData:
+  secretID: "test-secret-id"
+  secretKey: "test-secret-key"
+  apiEndpoint: "teo.tencentcloudapi.com"
+  timeout: "5s"
+  cacheTTL: "1h"
+  cacheSize: 1000
+  logLevel: info
