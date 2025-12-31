@@ -4,11 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
 	"net/http"
 	"net/netip"
+	"os"
 	"strings"
 	"time"
+
+	lru "github.com/hashicorp/golang-lru/v2/expirable"
+	"golang.org/x/sync/singleflight"
 )
 
 var (
@@ -55,7 +58,8 @@ type EdgeOneIP struct {
 	logger *PluginLogger
 
 	validator EdgeOneIPValidator
-	cache     *lruCache
+	cache     *lru.LRU[string, bool]
+	sg        singleflight.Group
 }
 
 // New created a new EdgeOneIP plugin.
@@ -84,10 +88,14 @@ func New(
 		return nil, fmt.Errorf("invalid timeout: %w", err)
 	}
 
-	cache := newLRUCache(config.CacheSize, cacheTTL)
+	cache := lru.NewLRU[string, bool](config.CacheSize, nil, cacheTTL)
 
 	timeoutSeconds := durationToTimeoutSeconds(timeout.Seconds())
-	validator, err := newTencentEdgeOneIPValidator(config.SecretID, config.SecretKey, config.APIEndpoint, timeoutSeconds)
+	validator, err := newTencentEdgeOneIPValidator(
+		os.ExpandEnv(config.SecretID),
+		os.ExpandEnv(config.SecretKey),
+		os.ExpandEnv(config.APIEndpoint),
+		timeoutSeconds)
 	if err != nil {
 		return nil, err
 	}
@@ -129,151 +137,63 @@ func (m *EdgeOneIP) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	isEdgeOne, err := m.validateEdgeOneIP(ctx, srcIP)
-	if err != nil {
-		m.logger.ErrorContext(ctx, "edgeone ip validation failed, treating as untrusted", "src_ip", srcIP.String(), "err", err)
+	isEdgeOne := false
+	if cached, ok := m.cache.Get(srcIP.String()); ok {
+		isEdgeOne = cached
+	} else if srcIP.IsPrivate() || srcIP.IsLoopback() || srcIP.IsLinkLocalMulticast() || srcIP.IsLinkLocalUnicast() {
 		isEdgeOne = false
-	}
-
-	realIP := srcIP
-	if isEdgeOne {
-		realIP = m.resolveRealIP(req, srcIP)
-	}
-
-	req.Header.Set(HeaderXRealIP, realIP.String())
-	if isEdgeOne {
-		req.Header.Set(HeaderXIsTrusted, "yes")
-		m.prependXForwardedFor(req, realIP)
 	} else {
-		req.Header.Set(HeaderXIsTrusted, "no")
+		valid, err, _ := m.sg.Do(srcIP.String(), func() (any, error) {
+			return m.validator.Validate(ctx, srcIP)
+		})
+		if err != nil {
+			m.logger.ErrorContext(ctx, "validateEdgeOneIP failed", "ip", srcIP.String(), "error", err)
+			isEdgeOne = false
+		} else {
+			isEdgeOne = valid.(bool)
+			m.cache.Add(srcIP.String(), isEdgeOne)
+		}
+	}
+
+	xff := make([]string, 0, 10) // set capacity to 10 to avoid unnecessary allocations
+	for _, header := range req.Header.Values(HeaderXForwardedFor) {
+		for val := range strings.SplitSeq(strings.TrimSpace(header), ",") {
+			if ip, err := netip.ParseAddr(strings.TrimSpace(val)); err == nil {
+				xff = append(xff, ip.String())
+			}
+		}
+	}
+	xff = append(xff, srcIP.String())
+
+	if isEdgeOne {
+		req.Header.Set(HeaderXForwardedFromEdgeOne, "yes")
+		req.Header.Set(HeaderXForwardedFor, strings.Join(xff, ", "))
+		req.Header.Set(HeaderXRealIP, xff[0])
+	} else {
+		req.Header.Set(HeaderXForwardedFromEdgeOne, "no")
 		req.Header.Set(HeaderXForwardedFor, srcIP.String())
+		req.Header.Set(HeaderXRealIP, srcIP.String())
 	}
 
 	m.next.ServeHTTP(rw, req)
 }
 
-func (m *EdgeOneIP) validateEdgeOneIP(ctx context.Context, ip netip.Addr) (bool, error) {
-	// Private/local/link-local source IPs can never be EdgeOne nodes.
-	// Short-circuit to avoid unnecessary API calls.
-	if isPrivateIP(ip) {
-		return false, nil
+func parseRemoteAddrIP(remoteAddr string) (*netip.Addr, error) {
+	var ip netip.Addr
+	var err error
+	switch strings.Count(remoteAddr, ":") {
+	case 0: // Plain IPv4 address
+		ip, err = netip.ParseAddr(remoteAddr)
+	case 1: // IPv4 address with port
+		ip, err = netip.ParseAddr(remoteAddr[:strings.LastIndex(remoteAddr, ":")])
+	default: // IPv6 address, might have port
+		if strings.HasPrefix(remoteAddr, "[") {
+			remoteAddr = remoteAddr[1:strings.LastIndex(remoteAddr, "]")]
+		}
+		ip, err = netip.ParseAddr(remoteAddr)
 	}
-
-	key := ip.String()
-	if cached, ok := m.cache.Get(key); ok {
-		return cached, nil
-	}
-
-	valid, err := m.validator.Validate(ctx, ip)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
-
-	m.cache.Add(key, valid)
-	return valid, nil
-}
-
-func parseRemoteAddrIP(remoteAddr string) (netip.Addr, error) {
-	// Best-effort: usually "IP:port". If SplitHostPort fails, try parsing as plain IP.
-	host := remoteAddr
-
-	if h, _, err := net.SplitHostPort(remoteAddr); err == nil {
-		host = h
-	}
-
-	host = strings.TrimPrefix(host, "[")
-	host = strings.TrimSuffix(host, "]")
-
-	ip, err := netip.ParseAddr(host)
-	if err != nil {
-		return netip.Addr{}, err
-	}
-
-	return ip, nil
-}
-
-func (m *EdgeOneIP) resolveRealIP(req *http.Request, srcIP netip.Addr) netip.Addr {
-	if ip, ok := parseSingleIPHeader(req, HeaderEoConnectingIP); ok {
-		return ip
-	}
-
-	if ip, ok := parseSingleIPHeader(req, HeaderXRealIP); ok && !isPrivateIP(ip) {
-		return ip
-	}
-
-	if ip, ok := parseXForwardedFor(req); ok {
-		return ip
-	}
-
-	return srcIP
-}
-
-func parseSingleIPHeader(req *http.Request, header string) (netip.Addr, bool) {
-	values := req.Header.Values(header)
-	if len(values) != 1 {
-		return netip.Addr{}, false
-	}
-	val := strings.TrimSpace(values[0])
-	if val == "" {
-		return netip.Addr{}, false
-	}
-	ip, err := netip.ParseAddr(val)
-	if err != nil {
-		return netip.Addr{}, false
-	}
-	return ip, true
-}
-
-func parseXForwardedFor(req *http.Request) (netip.Addr, bool) {
-	values := req.Header.Values(HeaderXForwardedFor)
-	if len(values) != 1 {
-		return netip.Addr{}, false
-	}
-
-	parts := strings.Split(values[0], ",")
-	for _, part := range parts {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
-		ip, err := netip.ParseAddr(part)
-		if err != nil {
-			continue
-		}
-		if isPrivateIP(ip) {
-			continue
-		}
-		return ip, true
-	}
-
-	return netip.Addr{}, false
-}
-
-func isPrivateIP(ip netip.Addr) bool {
-	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalMulticast() || ip.IsLinkLocalUnicast()
-}
-
-func (m *EdgeOneIP) prependXForwardedFor(req *http.Request, ip netip.Addr) {
-	if req.Header.Get(HeaderXForwardedFor) == "" {
-		req.Header.Set(HeaderXForwardedFor, ip.String())
-		return
-	}
-
-	newVals := make([]string, 0, 4)
-	newVals = append(newVals, ip.String())
-
-	//nolint:modernize // keep it simple/compatible for Traefik plugin runtime.
-	vals := strings.Split(req.Header.Get(HeaderXForwardedFor), ",")
-	for _, val := range vals {
-		val = strings.TrimSpace(val)
-		if val == "" {
-			continue
-		}
-		if val == ip.String() {
-			continue
-		}
-		newVals = append(newVals, val)
-	}
-
-	req.Header.Set(HeaderXForwardedFor, strings.Join(newVals, ", "))
+	return &ip, nil
 }

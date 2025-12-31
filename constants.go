@@ -1,10 +1,9 @@
 package traefik_edgeone_ip
 
 const (
-	HeaderEoConnectingIP = "Eo-Connecting-Ip"
-	HeaderXRealIP        = "X-Real-IP"
-	HeaderXForwardedFor  = "X-Forwarded-For"
-	HeaderXIsTrusted     = "X-Is-Trusted"
+	HeaderXRealIP               = "X-Real-IP"
+	HeaderXForwardedFor         = "X-Forwarded-For"
+	HeaderXForwardedFromEdgeOne = "X-Forwarded-From-EdgeOne"
 )
 
 const (

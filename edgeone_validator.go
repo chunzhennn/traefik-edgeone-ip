@@ -4,6 +4,7 @@ import (
 	"context"
 	"math"
 	"net/netip"
+	"slices"
 
 	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common"
 	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common/profile"
@@ -11,7 +12,7 @@ import (
 )
 
 type EdgeOneIPValidator interface {
-	Validate(ctx context.Context, ip netip.Addr) (bool, error)
+	Validate(ctx context.Context, ip *netip.Addr) (bool, error)
 }
 
 type tencentEdgeOneIPValidator struct {
@@ -46,27 +47,18 @@ func durationToTimeoutSeconds(durSeconds float64) int {
 	return int(math.Ceil(durSeconds))
 }
 
-func (v *tencentEdgeOneIPValidator) Validate(_ context.Context, ip netip.Addr) (bool, error) {
+func (v *tencentEdgeOneIPValidator) Validate(ctx context.Context, ip *netip.Addr) (bool, error) {
 	req := teo.NewDescribeIPRegionRequest()
+	req.SetContext(ctx)
 	req.IPs = []*string{common.StringPtr(ip.String())}
 
 	resp, err := v.client.DescribeIPRegion(req)
 	if err != nil {
 		return false, err
 	}
-
-	for _, info := range resp.Response.IPRegionInfo {
-		if info == nil || info.IsEdgeOneIP == nil || *info.IsEdgeOneIP != "yes" || info.IP == nil {
-			continue
-		}
-		parsed, err := netip.ParseAddr(*info.IP)
-		if err != nil {
-			continue
-		}
-		if parsed == ip {
-			return true, nil
-		}
-	}
-
-	return false, nil
+	validated := len(resp.Response.IPRegionInfo) > 0 &&
+		!slices.ContainsFunc(resp.Response.IPRegionInfo, func(info *teo.IPRegionInfo) bool {
+			return info == nil || info.IsEdgeOneIP == nil || *info.IsEdgeOneIP != "yes" || info.IP == nil
+		})
+	return validated, nil
 }
