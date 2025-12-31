@@ -51,6 +51,16 @@ func CreateConfig() *Config {
 	}
 }
 
+func expandConfig(config *Config) *Config {
+	return &Config{
+		SecretID:    os.ExpandEnv(config.SecretID),
+		SecretKey:   os.ExpandEnv(config.SecretKey),
+		APIEndpoint: os.ExpandEnv(config.APIEndpoint),
+		Timeout:     os.ExpandEnv(config.Timeout),
+		CacheTTL:    os.ExpandEnv(config.CacheTTL),
+	}
+}
+
 // EdgeOneIP middleware plugin.
 type EdgeOneIP struct {
 	next   http.Handler
@@ -72,7 +82,7 @@ func New(
 	if config == nil {
 		config = CreateConfig()
 	}
-
+	config = expandConfig(config)
 	if config.SecretID == "" || config.SecretKey == "" {
 		return nil, ErrMissingCredentials
 	}
@@ -92,9 +102,9 @@ func New(
 
 	timeoutSeconds := durationToTimeoutSeconds(timeout.Seconds())
 	validator, err := newTencentEdgeOneIPValidator(
-		os.ExpandEnv(config.SecretID),
-		os.ExpandEnv(config.SecretKey),
-		os.ExpandEnv(config.APIEndpoint),
+		config.SecretID,
+		config.SecretKey,
+		config.APIEndpoint,
 		timeoutSeconds)
 	if err != nil {
 		return nil, err
@@ -136,22 +146,23 @@ func (m *EdgeOneIP) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		m.next.ServeHTTP(rw, req)
 		return
 	}
+	ipStr := srcIP.String()
 
 	isEdgeOne := false
-	if cached, ok := m.cache.Get(srcIP.String()); ok {
+	if cached, ok := m.cache.Get(ipStr); ok {
 		isEdgeOne = cached
 	} else if srcIP.IsPrivate() || srcIP.IsLoopback() || srcIP.IsLinkLocalMulticast() || srcIP.IsLinkLocalUnicast() {
 		isEdgeOne = false
 	} else {
-		valid, err, _ := m.sg.Do(srcIP.String(), func() (any, error) {
+		valid, err, _ := m.sg.Do(ipStr, func() (any, error) {
 			return m.validator.Validate(ctx, srcIP)
 		})
 		if err != nil {
-			m.logger.ErrorContext(ctx, "validateEdgeOneIP failed", "ip", srcIP.String(), "error", err)
+			m.logger.ErrorContext(ctx, "validateEdgeOneIP failed", "ip", ipStr, "error", err)
 			isEdgeOne = false
 		} else {
 			isEdgeOne = valid.(bool)
-			m.cache.Add(srcIP.String(), isEdgeOne)
+			m.cache.Add(ipStr, isEdgeOne)
 		}
 	}
 
@@ -163,7 +174,7 @@ func (m *EdgeOneIP) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 			}
 		}
 	}
-	xff = append(xff, srcIP.String())
+	xff = append(xff, ipStr)
 
 	if isEdgeOne {
 		req.Header.Set(HeaderXForwardedFromEdgeOne, "yes")
@@ -171,8 +182,8 @@ func (m *EdgeOneIP) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		req.Header.Set(HeaderXRealIP, xff[0])
 	} else {
 		req.Header.Set(HeaderXForwardedFromEdgeOne, "no")
-		req.Header.Set(HeaderXForwardedFor, srcIP.String())
-		req.Header.Set(HeaderXRealIP, srcIP.String())
+		req.Header.Set(HeaderXForwardedFor, ipStr)
+		req.Header.Set(HeaderXRealIP, ipStr)
 	}
 
 	m.next.ServeHTTP(rw, req)
