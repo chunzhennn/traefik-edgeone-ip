@@ -2,20 +2,18 @@ package traefik_edgeone_ip
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"net/http"
 	"net/netip"
-	"os"
 	"strings"
 	"time"
 
 	lru "github.com/hashicorp/golang-lru/v2/expirable"
 	"golang.org/x/sync/singleflight"
+	"golang.org/x/xerrors"
 )
 
 var (
-	ErrMissingCredentials = errors.New("missing EdgeOne credentials: secretID and secretKey are required")
+	ErrMissingCredentials = xerrors.New("missing EdgeOne credentials: secretID and secretKey are required")
 )
 
 // Config the plugin configuration.
@@ -51,16 +49,6 @@ func CreateConfig() *Config {
 	}
 }
 
-func expandConfig(config *Config) *Config {
-	return &Config{
-		SecretID:    os.ExpandEnv(config.SecretID),
-		SecretKey:   os.ExpandEnv(config.SecretKey),
-		APIEndpoint: os.ExpandEnv(config.APIEndpoint),
-		Timeout:     os.ExpandEnv(config.Timeout),
-		CacheTTL:    os.ExpandEnv(config.CacheTTL),
-	}
-}
-
 // EdgeOneIP middleware plugin.
 type EdgeOneIP struct {
 	next   http.Handler
@@ -82,7 +70,6 @@ func New(
 	if config == nil {
 		config = CreateConfig()
 	}
-	config = expandConfig(config)
 	if config.SecretID == "" || config.SecretKey == "" {
 		return nil, ErrMissingCredentials
 	}
@@ -91,11 +78,11 @@ func New(
 
 	cacheTTL, err := parseDurationWithDefault(config.CacheTTL, time.Hour)
 	if err != nil {
-		return nil, fmt.Errorf("invalid cacheTTL: %w", err)
+		return nil, xerrors.Errorf("invalid cacheTTL: %w", err)
 	}
 	timeout, err := parseDurationWithDefault(config.Timeout, 5*time.Second)
 	if err != nil {
-		return nil, fmt.Errorf("invalid timeout: %w", err)
+		return nil, xerrors.Errorf("invalid timeout: %w", err)
 	}
 
 	cache := lru.NewLRU[string, bool](config.CacheSize, nil, cacheTTL)

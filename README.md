@@ -35,6 +35,9 @@ http:
           logLevel: "info"
 ```
 
+> 注意：本插件**不会**对配置值做环境变量展开（不会对 `${VAR}` / `$VAR` 做 `ExpandEnv`）。  
+> 如需使用环境变量，请确保由 Traefik 或你的部署/模板系统在加载配置前完成替换，或直接填写明文配置值。
+
 ## 行为说明
 
 - **可信判断**：对 `req.RemoteAddr` 的来源 IP 调用 EdgeOne API 校验；结果会被 LRU 缓存（默认 1000 条、TTL 1h）。
@@ -51,5 +54,3 @@ http:
 ## License
 
 MIT
-
-
